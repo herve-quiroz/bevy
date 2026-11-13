@@ -4,7 +4,9 @@ use bevy_asset::{prelude::AssetChanged, Assets};
 use bevy_camera::visibility::ViewVisibility;
 use bevy_ecs::prelude::*;
 use bevy_math::Mat4;
-use bevy_mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
+use bevy_mesh::skinning::{
+    PaletteSkinnedMesh, SkinPalette, SkinnedMesh, SkinnedMeshInverseBindposes,
+};
 use bevy_render::render_resource::{Buffer, BufferDescriptor};
 use bevy_render::settings::WgpuLimits;
 use bevy_render::sync_world::{MainEntity, MainEntityHashMap};
@@ -39,6 +41,10 @@ const MAX_TOTAL_JOINTS: u32 = 1024 * 1024 * 1024;
 /// we need to allocate 4 64-byte matrices at a time to satisfy alignment
 /// requirements.
 const JOINTS_PER_ALLOCATION_UNIT: u32 = (256 / size_of::<Mat4>()) as u32;
+
+/// The bit of a mesh's skin index that says its joint matrices come from a [`SkinPalette`], in
+/// the mesh's local space, so the shader applies the mesh's own transform after skinning.
+pub const LOCAL_SPACE_SKIN_INDEX_BIT: u32 = 1 << 31;
 
 /// The location of the first joint matrix in the skin uniform buffer.
 #[derive(Clone, Copy)]
@@ -93,6 +99,10 @@ pub struct SkinUniforms {
     /// We use this as part of our heuristic to decide whether to use
     /// fine-grained change detection.
     total_joints: usize,
+    /// Allocation information about each [`SkinPalette`], by the entity carrying it.
+    palette_info: MainEntityHashMap<PaletteInfo>,
+    /// The palette entity of each mesh skinned by a [`PaletteSkinnedMesh`].
+    palette_of: MainEntityHashMap<MainEntity>,
 }
 
 pub fn skin_uniforms_from_world(device: Res<RenderDevice>, mut commands: Commands) {
@@ -125,29 +135,69 @@ pub fn skin_uniforms_from_world(device: Res<RenderDevice>, mut commands: Command
         allocator: Allocator::new(MAX_TOTAL_JOINTS),
         skin_uniform_info: MainEntityHashMap::default(),
         total_joints: 0,
+        palette_info: MainEntityHashMap::default(),
+        palette_of: MainEntityHashMap::default(),
     };
 
     commands.insert_resource(res);
 }
 
 impl SkinUniforms {
-    /// Returns the current offset in joints of the skin in the buffer.
+    /// Returns the current offset in joints of the skin in the buffer, with
+    /// [`LOCAL_SPACE_SKIN_INDEX_BIT`] set for a mesh skinned by a [`SkinPalette`].
     pub fn skin_index(&self, skin: MainEntity) -> Option<u32> {
         self.skin_uniform_info
             .get(&skin)
             .map(SkinUniformInfo::offset)
+            .or_else(|| {
+                self.palette_offset(skin)
+                    .map(|offset| offset | LOCAL_SPACE_SKIN_INDEX_BIT)
+            })
     }
 
     /// Returns the current offset in bytes of the skin in the buffer.
     pub fn skin_byte_offset(&self, skin: MainEntity) -> Option<SkinByteOffset> {
-        self.skin_uniform_info.get(&skin).map(|skin_uniform_info| {
-            SkinByteOffset::from_index(skin_uniform_info.offset() as usize)
-        })
+        self.skin_uniform_info
+            .get(&skin)
+            .map(SkinUniformInfo::offset)
+            .or_else(|| self.palette_offset(skin))
+            .map(|offset| SkinByteOffset::from_index(offset as usize))
     }
 
-    /// Returns an iterator over all skins in the scene.
+    /// Whether the mesh is skinned by a [`SkinPalette`] that has no space in the buffers yet.
+    pub fn skin_pending(&self, skin: MainEntity) -> bool {
+        self.palette_of.contains_key(&skin) && self.palette_offset(skin).is_none()
+    }
+
+    /// The offset in joints of the palette skinning the mesh.
+    fn palette_offset(&self, skin: MainEntity) -> Option<u32> {
+        let palette = self.palette_of.get(&skin)?;
+        self.palette_info.get(palette).map(PaletteInfo::offset)
+    }
+
+    /// Returns an iterator over all skinned meshes in the scene.
     pub fn all_skins(&self) -> impl Iterator<Item = &MainEntity> {
-        self.skin_uniform_info.keys()
+        self.skin_uniform_info.keys().chain(
+            self.palette_of
+                .iter()
+                .filter(|(_, palette)| self.palette_info.contains_key(*palette))
+                .map(|(mesh, _)| mesh),
+        )
+    }
+}
+
+/// Allocation information about each [`SkinPalette`].
+struct PaletteInfo {
+    /// The allocation of the matrices within the [`SkinUniforms::current_buffer`].
+    allocation: Allocation,
+    /// The number of matrices.
+    len: usize,
+}
+
+impl PaletteInfo {
+    /// The offset in joints within the [`SkinUniforms::current_staging_buffer`].
+    fn offset(&self) -> u32 {
+        self.allocation.offset * JOINTS_PER_ALLOCATION_UNIT
     }
 }
 
@@ -286,6 +336,12 @@ pub fn extract_skins(
     changed_transforms: Extract<Query<(Entity, &GlobalTransform), Changed<GlobalTransform>>>,
     joints: Extract<Query<&GlobalTransform>>,
     mut removed_skinned_meshes_query: Extract<RemovedComponents<SkinnedMesh>>,
+    changed_palettes: Extract<Query<(Entity, &SkinPalette), Changed<SkinPalette>>>,
+    mut removed_palettes: Extract<RemovedComponents<SkinPalette>>,
+    changed_palette_meshes: Extract<
+        Query<(Entity, &PaletteSkinnedMesh), Changed<PaletteSkinnedMesh>>,
+    >,
+    mut removed_palette_meshes: Extract<RemovedComponents<PaletteSkinnedMesh>>,
 ) {
     let skin_uniforms = skin_uniforms.into_inner();
 
@@ -320,6 +376,75 @@ pub fn extract_skins(
             remove_skin(skin_uniforms, skinned_mesh_entity.into());
         }
     }
+
+    // Palettes: freed when removed, allocated when first seen, copied when changed.
+    for palette in removed_palettes.read() {
+        if changed_palettes.contains(palette) {
+            continue;
+        }
+        if let Some(info) = skin_uniforms
+            .palette_info
+            .remove(&MainEntity::from(palette))
+        {
+            skin_uniforms.allocator.free(info.allocation);
+        }
+    }
+    for (palette, matrices) in &changed_palettes {
+        write_palette(skin_uniforms, palette.into(), &matrices.0);
+    }
+    for mesh in removed_palette_meshes.read() {
+        if !changed_palette_meshes.contains(mesh) {
+            skin_uniforms.palette_of.remove(&MainEntity::from(mesh));
+        }
+    }
+    for (mesh, skin) in &changed_palette_meshes {
+        skin_uniforms
+            .palette_of
+            .insert(mesh.into(), skin.palette.into());
+    }
+}
+
+/// Writes a palette's matrices into the staging buffer, allocating its space the first time.
+fn write_palette(skin_uniforms: &mut SkinUniforms, palette: MainEntity, matrices: &[Mat4]) {
+    if !skin_uniforms.palette_info.contains_key(&palette) {
+        let Some(allocation) = skin_uniforms.allocator.allocate(
+            matrices
+                .len()
+                .max(1)
+                .div_ceil(JOINTS_PER_ALLOCATION_UNIT as usize) as u32,
+        ) else {
+            error!(
+                "Out of space for skin palette: {:?}. Tried to allocate space for {:?} joints.",
+                palette,
+                matrices.len()
+            );
+            return;
+        };
+        skin_uniforms.palette_info.insert(
+            palette,
+            PaletteInfo {
+                allocation,
+                len: matrices.len(),
+            },
+        );
+    }
+    let info = &skin_uniforms.palette_info[&palette];
+    if info.len != matrices.len() {
+        error!(
+            "Skin palette {:?} changed length from {} to {}; its length is fixed.",
+            palette,
+            info.len,
+            matrices.len()
+        );
+    }
+    let start = info.offset() as usize;
+    let len = info.len.min(matrices.len());
+    if skin_uniforms.current_staging_buffer.len() < start + len {
+        skin_uniforms
+            .current_staging_buffer
+            .resize(start + len, Mat4::IDENTITY);
+    }
+    skin_uniforms.current_staging_buffer[start..start + len].copy_from_slice(&matrices[..len]);
 }
 
 /// Searches for all skins that have become visible or invisible this frame and
@@ -501,7 +626,13 @@ fn remove_skin(skin_uniforms: &mut SkinUniforms, skinned_mesh_entity: MainEntity
 // entity and so cannot currently be batched on WebGL 2.
 pub fn no_automatic_skin_batching(
     mut commands: Commands,
-    query: Query<Entity, (With<SkinnedMesh>, Without<NoAutomaticBatching>)>,
+    query: Query<
+        Entity,
+        (
+            Or<(With<SkinnedMesh>, With<PaletteSkinnedMesh>)>,
+            Without<NoAutomaticBatching>,
+        ),
+    >,
     render_device: Res<RenderDevice>,
 ) {
     if !skins_use_uniform_buffers(&render_device.limits()) {

@@ -1460,10 +1460,12 @@ impl RenderMeshInstanceGpuBuilder {
                 ),
                 None => (false, 0, 0),
             };
-        let current_skin_index = match skin_uniforms.skin_byte_offset(entity) {
-            Some(skin_index) => skin_index.index(),
-            None => u32::MAX,
-        };
+        // A mesh whose skin palette has no space yet waits a frame, as one whose material is
+        // not prepared does.
+        if skin_uniforms.skin_pending(entity) {
+            return None;
+        }
+        let current_skin_index = skin_uniforms.skin_index(entity).unwrap_or(u32::MAX);
 
         let lightmap_slot = match render_lightmaps.render_lightmaps.get(&entity) {
             Some(render_lightmap) => u16::from(*render_lightmap.slot_index),

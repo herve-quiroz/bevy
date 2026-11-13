@@ -21,6 +21,27 @@ pub struct SkinnedMesh {
     pub joints: Vec<Entity>,
 }
 
+/// Joint matrices written directly by the app, with no joint entities, for the meshes that name
+/// this entity in their [`PaletteSkinnedMesh`].
+///
+/// Each matrix takes a vertex from bind space to the local space of the meshes that use the
+/// palette (a joint's transform in that space times its inverse bindpose), and the mesh's own
+/// `GlobalTransform` then places the result in the world. Meshes sharing one palette must
+/// therefore share one local space, and a palette that only moves with its meshes does not
+/// change. A mesh's joint indices index the palette directly.
+///
+/// The palette's length is fixed once the renderer first sees it.
+#[derive(Component, Debug, Default, Clone, PartialEq)]
+pub struct SkinPalette(pub Vec<Mat4>);
+
+/// Skins this mesh with the [`SkinPalette`] on `palette` instead of a [`SkinnedMesh`]'s joint
+/// entities.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteSkinnedMesh {
+    /// The entity carrying the [`SkinPalette`].
+    pub palette: Entity,
+}
+
 impl AsAssetId for SkinnedMesh {
     type Asset = SkinnedMeshInverseBindposes;
 

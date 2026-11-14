@@ -46,6 +46,7 @@ mod volumetric;
 pub use volumetric::{FogVolume, VolumetricFog, VolumetricLight};
 pub mod cascade;
 use cascade::build_directional_light_cascades;
+use cascade::Cascade;
 pub use cascade::{CascadeShadowConfig, CascadeShadowConfigBuilder, Cascades};
 mod point_light;
 pub use point_light::{
@@ -262,6 +263,103 @@ pub type WithLight = Or<(
 #[derive(Debug, Component, Reflect, Default, Clone, PartialEq)]
 #[reflect(Component, Default, Debug, Clone, PartialEq)]
 pub struct NotShadowCaster;
+/// Bounds how far, in world units along a [`DirectionalLight`]'s direction, the shadow of a
+/// [`Mesh3d`] can fall past its [`Aabb`] onto anything that receives it.
+///
+/// A directional light's cascade normally draws every caster inside its orthographic box, whose
+/// footprint is far wider than the slice of the view frustum the cascade shades. With this
+/// component, a cascade draws the caster only when the caster's bounds, swept this far along the
+/// light's direction and grown by the cascade's filtering and normal bias margin, can reach the
+/// slice of the view frustum that samples the cascade. A character standing on the ground, for
+/// example, needs no more than the distance from its top to the ground along the light.
+///
+/// The value applies to every directional light. `f32::INFINITY` sweeps without end.
+#[derive(Debug, Component, Reflect, Clone, Copy, PartialEq)]
+#[reflect(Component, Debug, Clone, PartialEq)]
+pub struct ShadowCasterReach(pub f32);
+
+/// How many shadow map texels, beyond the light's normal bias, a cascade's slice is grown by when
+/// [`ShadowCasterReach`] culls casters: room for the widest filter kernel to sample a texel
+/// whose caster lies just outside the slice.
+const SHADOW_CASTER_REACH_MARGIN_TEXELS: f32 = 8.0;
+
+/// One cascade's slice of a view frustum, for [`ShadowCasterReach`]: the half-spaces holding the
+/// points whose shading samples the cascade (inward normal and distance, `n·p + d >= 0` inside),
+/// and the margin they are grown by.
+#[derive(Clone, Copy)]
+struct CascadeSlice {
+    planes: [(Vec3A, f32); 6],
+    margin: f32,
+}
+
+impl CascadeSlice {
+    /// The slices of the view whose camera has `frustum` and `view_transform`, one per cascade.
+    fn of_view(
+        frustum: &Frustum,
+        view_transform: &GlobalTransform,
+        config: &CascadeShadowConfig,
+        cascades: &[Cascade],
+        normal_bias: f32,
+    ) -> Vec<CascadeSlice> {
+        let forward = Vec3A::from(view_transform.forward().as_vec3());
+        let eye = forward.dot(view_transform.translation_vec3a());
+        let overlap = 1.0 - config.overlap_proportion;
+        let half_spaces = &frustum.half_spaces;
+        cascades
+            .iter()
+            .zip(&config.bounds)
+            .enumerate()
+            .map(|(i, (cascade, &far))| {
+                // The shader samples cascade `i` from the previous cascade's blend band on.
+                let near = if i == 0 {
+                    f32::NEG_INFINITY
+                } else {
+                    overlap * config.bounds[i - 1]
+                };
+                let side = |k: usize| (half_spaces[k].normal(), half_spaces[k].d());
+                CascadeSlice {
+                    planes: [
+                        side(0),
+                        side(1),
+                        side(2),
+                        side(3),
+                        (forward, -(eye + near)),
+                        (-forward, eye + far),
+                    ],
+                    margin: (normal_bias + SHADOW_CASTER_REACH_MARGIN_TEXELS)
+                        * cascade.texel_size
+                        * core::f32::consts::SQRT_2,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the oriented box `aabb` under `world_from_local`, swept `reach` along `light_dir`,
+    /// can reach this slice: no half-space has the whole swept box outside it.
+    fn reached_by(
+        &self,
+        aabb: &Aabb,
+        world_from_local: &bevy_math::Affine3A,
+        light_dir: Vec3A,
+        reach: f32,
+    ) -> bool {
+        let centre = world_from_local.transform_point3a(aabb.center);
+        let axes = world_from_local.matrix3;
+        let half = aabb.half_extents;
+        self.planes.iter().all(|&(normal, d)| {
+            if d.is_infinite() {
+                return d > 0.0;
+            }
+            let radius = (normal.dot(axes.x_axis) * half.x).abs()
+                + (normal.dot(axes.y_axis) * half.y).abs()
+                + (normal.dot(axes.z_axis) * half.z).abs();
+            let along = normal.dot(light_dir);
+            let sweep = if along > 0.0 { along * reach } else { 0.0 };
+            normal.dot(centre) + d + radius + sweep + self.margin >= 0.0
+        })
+    }
+}
+
 /// Add this component to make a [`Mesh3d`] not receive shadows.
 ///
 /// **Note:** If you're using diffuse transmission, setting [`NotShadowReceiver`] will
@@ -348,9 +446,11 @@ pub fn check_dir_light_mesh_visibility(
             &mut CascadesVisibleEntities,
             Option<&RenderLayers>,
             &ViewVisibility,
+            (&GlobalTransform, &CascadeShadowConfig, &Cascades),
         ),
         Without<SpotLight>,
     >,
+    view_frusta_query: Query<(&Frustum, &GlobalTransform)>,
     visible_entity_query: Query<
         (
             Entity,
@@ -360,6 +460,7 @@ pub fn check_dir_light_mesh_visibility(
             Option<&GlobalTransform>,
             Has<VisibilityRange>,
             Has<NoFrustumCulling>,
+            Option<&ShadowCasterReach>,
         ),
         (
             Without<NotShadowCaster>,
@@ -374,9 +475,17 @@ pub fn check_dir_light_mesh_visibility(
 ) {
     let visible_entity_ranges = visible_entity_ranges.as_deref();
 
-    for (directional_light, frusta, mut visible_entities, maybe_view_mask, light_view_visibility) in
-        &mut directional_lights
+    for (
+        directional_light,
+        frusta,
+        mut visible_entities,
+        maybe_view_mask,
+        light_view_visibility,
+        (light_transform, cascades_config, cascades),
+    ) in &mut directional_lights
     {
+        // The light shines along its local -Z.
+        let light_dir = Vec3A::from(light_transform.forward().as_vec3());
         let mut views_to_remove = Vec::new();
         for (view, cascade_view_entities) in &mut visible_entities.entities {
             match frusta.frusta.get(view) {
@@ -406,6 +515,24 @@ pub fn check_dir_light_mesh_visibility(
         let view_mask = maybe_view_mask.unwrap_or_default();
 
         for (view, view_frusta) in &frusta.frusta {
+            // The slices of the view that sample each cascade, for casters with a reach.
+            let slices = match (view_frusta_query.get(*view), cascades.cascades.get(view)) {
+                (Ok((frustum, view_transform)), Some(view_cascades))
+                    if view_cascades.len() == view_frusta.len()
+                        && cascades_config.bounds.len() == view_frusta.len() =>
+                {
+                    Some(CascadeSlice::of_view(
+                        frustum,
+                        view_transform,
+                        cascades_config,
+                        view_cascades,
+                        directional_light.shadow_normal_bias,
+                    ))
+                }
+                _ => None,
+            };
+            let slices = slices.as_deref();
+
             // Resize any per-thread buffer left at a stale state from a prior frame.
             // Threads receiving no work this frame won't run the `init` closure from `par_iter`, and without this
             // their buffer might be indexed out-of-bounds during collection if the number of cascades has increased.
@@ -428,6 +555,7 @@ pub fn check_dir_light_mesh_visibility(
                     maybe_transform,
                     has_visibility_range,
                     has_no_frustum_culling,
+                    maybe_reach,
                 )| {
                     if !inherited_visibility.get() {
                         return;
@@ -449,13 +577,27 @@ pub fn check_dir_light_mesh_visibility(
 
                     if let (Some(aabb), Some(transform)) = (maybe_aabb, maybe_transform) {
                         let mut visible = false;
-                        for (frustum, frustum_visible_entities) in view_frusta
+                        let world_from_local = transform.affine();
+                        for (index, (frustum, frustum_visible_entities)) in view_frusta
                             .iter()
                             .zip(view_visible_entities_local_queue.iter_mut())
+                            .enumerate()
                         {
                             // Disable near-plane culling, as a shadow caster could lie before the near plane.
                             if !has_no_frustum_culling
-                                && !frustum.intersects_obb(aabb, &transform.affine(), false, true)
+                                && !frustum.intersects_obb(aabb, &world_from_local, false, true)
+                            {
+                                continue;
+                            }
+                            // A caster whose shadow cannot reach the slice this cascade shades.
+                            if !has_no_frustum_culling
+                                && let (Some(reach), Some(slices)) = (maybe_reach, slices)
+                                && !slices[index].reached_by(
+                                    aabb,
+                                    &world_from_local,
+                                    light_dir,
+                                    reach.0,
+                                )
                             {
                                 continue;
                             }
@@ -797,4 +939,51 @@ pub fn get_shadow_lod_origin(
     };
 
     None
+}
+
+#[cfg(test)]
+mod shadow_caster_reach_tests {
+    use super::*;
+    use bevy_camera::{CameraProjection, PerspectiveProjection};
+    use bevy_math::{Affine3A, Vec3};
+    use bevy_transform::components::Transform;
+
+    /// A camera at the origin looking down -Z, cascades ending at 10 and 50 units, the light
+    /// shining straight down: a caster standing on the ground 30 units ahead shades only the
+    /// second cascade with a short reach, and both with an endless one.
+    #[test]
+    fn a_caster_reaches_only_the_slices_its_swept_bounds_meet() {
+        let projection = PerspectiveProjection::default();
+        let view_transform = GlobalTransform::from(Transform::from_xyz(0.0, 2.0, 0.0));
+        let frustum = projection.compute_frustum(&view_transform);
+        let config = CascadeShadowConfig {
+            bounds: vec![10.0, 50.0],
+            overlap_proportion: 0.2,
+            minimum_distance: 0.1,
+        };
+        let cascades = vec![
+            Cascade {
+                texel_size: 0.01,
+                ..Default::default()
+            };
+            2
+        ];
+        let slices = CascadeSlice::of_view(&frustum, &view_transform, &config, &cascades, 1.8);
+        let aabb = Aabb::from_min_max(Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 2.0, 0.5));
+        let down = Vec3A::NEG_Y;
+        let at = |z: f32| Affine3A::from_translation(Vec3::new(0.0, 0.0, z));
+
+        assert!(!slices[0].reached_by(&aabb, &at(-30.0), down, 1.0));
+        assert!(slices[1].reached_by(&aabb, &at(-30.0), down, 1.0));
+        // Swept without end, its shadow passes under the first slice's floor of view.
+        assert!(slices[0].reached_by(&aabb, &at(-5.0), down, f32::INFINITY));
+        // Behind the camera, nothing is reached.
+        assert!(!slices[0].reached_by(&aabb, &at(30.0), down, 1.0));
+        assert!(!slices[1].reached_by(&aabb, &at(30.0), down, 1.0));
+        // Past the last cascade's far bound.
+        assert!(!slices[1].reached_by(&aabb, &at(-80.0), down, 1.0));
+        // Just inside the second slice's near bound, 0.8 × 10.
+        assert!(slices[1].reached_by(&aabb, &at(-8.5), down, 1.0));
+        assert!(!slices[1].reached_by(&aabb, &at(-7.0), down, 1.0));
+    }
 }

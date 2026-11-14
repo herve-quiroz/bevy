@@ -485,6 +485,18 @@ impl SpecializedMeshPipeline for MaterialPipelineSpecializer {
             .layout
             .insert(3, self.properties.material_layout.as_ref().unwrap().clone());
 
+        // An opaque mesh that may discard keeps its depth test but skips the depth write when the
+        // depth prepass has already written its depth, so the GPU keeps its early depth test.
+        if self.properties.prepass_enabled
+            && concrete_mesh_key
+                .contains(MeshPipelineKey::DEPTH_PREPASS | MeshPipelineKey::MAY_DISCARD)
+            && concrete_mesh_key.intersection(MeshPipelineKey::BLEND_RESERVED_BITS)
+                == MeshPipelineKey::BLEND_OPAQUE
+            && let Some(depth_stencil) = descriptor.depth_stencil.as_mut()
+        {
+            depth_stencil.depth_write_enabled = Some(false);
+        }
+
         if let Some(specialize) = self.properties.user_specialize {
             specialize(&self.pipeline as &dyn Any, &mut descriptor, layout, key)?;
         }

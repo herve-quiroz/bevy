@@ -10,7 +10,7 @@ use bevy_mesh::skinning::{
 };
 use bevy_render::render_resource::{Buffer, BufferDescriptor};
 use bevy_render::settings::WgpuLimits;
-use bevy_render::sync_world::{MainEntity, MainEntityHashMap};
+use bevy_render::sync_world::{MainEntity, MainEntityHashMap, MainEntityHashSet};
 use bevy_render::{
     batching::NoAutomaticBatching,
     render_resource::BufferUsages,
@@ -104,6 +104,9 @@ pub struct SkinUniforms {
     palette_info: MainEntityHashMap<PaletteInfo>,
     /// The palette entity of each mesh skinned by a [`PaletteSkinnedMesh`].
     palette_of: MainEntityHashMap<MainEntity>,
+    /// The palettes whose failure (no space, a length change, a mesh naming an entity with no
+    /// palette) was logged, so a palette rewritten every frame logs it once.
+    palettes_reported: MainEntityHashSet,
     /// The ranges of joints in [`Self::current_staging_buffer`] written this frame.
     changed: Vec<Range<u32>>,
     /// The ranges written last frame: the buffer from two frames ago that this frame overwrites
@@ -143,6 +146,7 @@ pub fn skin_uniforms_from_world(device: Res<RenderDevice>, mut commands: Command
         total_joints: 0,
         palette_info: MainEntityHashMap::default(),
         palette_of: MainEntityHashMap::default(),
+        palettes_reported: MainEntityHashSet::default(),
         changed: Vec::new(),
         prev_changed: Vec::new(),
     };
@@ -390,7 +394,7 @@ pub fn extract_skins(
         Query<(Entity, &PaletteSkinnedMesh), Changed<PaletteSkinnedMesh>>,
     >,
     mut removed_palette_meshes: Extract<RemovedComponents<PaletteSkinnedMesh>>,
-    palette_meshes: Extract<Query<(&PaletteSkinnedMesh, &GlobalTransform)>>,
+    palette_meshes: Extract<Query<(Entity, &PaletteSkinnedMesh, &GlobalTransform)>>,
 ) {
     let skin_uniforms = skin_uniforms.into_inner();
 
@@ -432,10 +436,9 @@ pub fn extract_skins(
         if changed_palettes.contains(palette) {
             continue;
         }
-        if let Some(info) = skin_uniforms
-            .palette_info
-            .remove(&MainEntity::from(palette))
-        {
+        let palette = MainEntity::from(palette);
+        skin_uniforms.palettes_reported.remove(&palette);
+        if let Some(info) = skin_uniforms.palette_info.remove(&palette) {
             skin_uniforms.allocator.free(info.allocation);
         }
     }
@@ -452,11 +455,17 @@ pub fn extract_skins(
             .palette_of
             .insert(mesh.into(), skin.palette.into());
     }
-    for (skin, transform) in &palette_meshes {
-        let Some(info) = skin_uniforms
-            .palette_info
-            .get_mut(&MainEntity::from(skin.palette))
-        else {
+    for (mesh, skin, transform) in &palette_meshes {
+        let palette = MainEntity::from(skin.palette);
+        let Some(info) = skin_uniforms.palette_info.get_mut(&palette) else {
+            // The mesh waits for its palette (`SkinUniforms::skin_pending`) and is not drawn.
+            if skin_uniforms.palettes_reported.insert(palette) {
+                error!(
+                    "Skinned mesh {:?} names skin palette {:?}, which has no SkinPalette or no \
+                     space in the skin buffers; the mesh is not drawn.",
+                    mesh, palette
+                );
+            }
             continue;
         };
         let world_from_local = transform.to_matrix();
@@ -496,11 +505,13 @@ fn set_palette(skin_uniforms: &mut SkinUniforms, palette: MainEntity, matrices: 
                 .max(1)
                 .div_ceil(JOINTS_PER_ALLOCATION_UNIT as usize) as u32,
         ) else {
-            error!(
-                "Out of space for skin palette: {:?}. Tried to allocate space for {:?} joints.",
-                palette,
-                matrices.len()
-            );
+            if skin_uniforms.palettes_reported.insert(palette) {
+                error!(
+                    "Out of space for skin palette: {:?}. Tried to allocate space for {:?} joints.",
+                    palette,
+                    matrices.len()
+                );
+            }
             return;
         };
         skin_uniforms.palette_info.insert(
@@ -518,12 +529,14 @@ fn set_palette(skin_uniforms: &mut SkinUniforms, palette: MainEntity, matrices: 
         .palette_info
         .get_mut(&palette)
         .expect("allocated above");
-    if info.len != matrices.len() {
+    if info.len != matrices.len() && skin_uniforms.palettes_reported.insert(palette) {
         error!(
-            "Skin palette {:?} changed length from {} to {}; its length is fixed.",
+            "Skin palette {:?} changed length from {} to {}; its length is fixed, so only its \
+             first {} matrices are used.",
             palette,
             info.len,
-            matrices.len()
+            matrices.len(),
+            info.len.min(matrices.len())
         );
     }
     let len = info.len.min(matrices.len());

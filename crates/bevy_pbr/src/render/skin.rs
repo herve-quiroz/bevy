@@ -42,10 +42,6 @@ const MAX_TOTAL_JOINTS: u32 = 1024 * 1024 * 1024;
 /// requirements.
 const JOINTS_PER_ALLOCATION_UNIT: u32 = (256 / size_of::<Mat4>()) as u32;
 
-/// The bit of a mesh's skin index that says its joint matrices come from a [`SkinPalette`], in
-/// the mesh's local space, so the shader applies the mesh's own transform after skinning.
-pub const LOCAL_SPACE_SKIN_INDEX_BIT: u32 = 1 << 31;
-
 /// The location of the first joint matrix in the skin uniform buffer.
 #[derive(Clone, Copy)]
 pub struct SkinByteOffset {
@@ -143,16 +139,12 @@ pub fn skin_uniforms_from_world(device: Res<RenderDevice>, mut commands: Command
 }
 
 impl SkinUniforms {
-    /// Returns the current offset in joints of the skin in the buffer, with
-    /// [`LOCAL_SPACE_SKIN_INDEX_BIT`] set for a mesh skinned by a [`SkinPalette`].
+    /// Returns the current offset in joints of the skin in the buffer.
     pub fn skin_index(&self, skin: MainEntity) -> Option<u32> {
         self.skin_uniform_info
             .get(&skin)
             .map(SkinUniformInfo::offset)
-            .or_else(|| {
-                self.palette_offset(skin)
-                    .map(|offset| offset | LOCAL_SPACE_SKIN_INDEX_BIT)
-            })
+            .or_else(|| self.palette_offset(skin))
     }
 
     /// Returns the current offset in bytes of the skin in the buffer.
@@ -192,6 +184,13 @@ struct PaletteInfo {
     allocation: Allocation,
     /// The number of matrices.
     len: usize,
+    /// The app's matrices, in the local space of the palette's meshes.
+    local: Vec<Mat4>,
+    /// The world transform of the palette's meshes, folded into each matrix written to the
+    /// buffers.
+    world_from_local: Mat4,
+    /// Whether the folded matrices must be written again this frame.
+    dirty: bool,
 }
 
 impl PaletteInfo {
@@ -342,6 +341,7 @@ pub fn extract_skins(
         Query<(Entity, &PaletteSkinnedMesh), Changed<PaletteSkinnedMesh>>,
     >,
     mut removed_palette_meshes: Extract<RemovedComponents<PaletteSkinnedMesh>>,
+    palette_meshes: Extract<Query<(&PaletteSkinnedMesh, &GlobalTransform)>>,
 ) {
     let skin_uniforms = skin_uniforms.into_inner();
 
@@ -377,7 +377,8 @@ pub fn extract_skins(
         }
     }
 
-    // Palettes: freed when removed, allocated when first seen, copied when changed.
+    // Palettes: freed when removed, allocated when first seen, written again when their matrices
+    // or their meshes' transform changed.
     for palette in removed_palettes.read() {
         if changed_palettes.contains(palette) {
             continue;
@@ -390,7 +391,7 @@ pub fn extract_skins(
         }
     }
     for (palette, matrices) in &changed_palettes {
-        write_palette(skin_uniforms, palette.into(), &matrices.0);
+        set_palette(skin_uniforms, palette.into(), &matrices.0);
     }
     for mesh in removed_palette_meshes.read() {
         if !changed_palette_meshes.contains(mesh) {
@@ -402,10 +403,41 @@ pub fn extract_skins(
             .palette_of
             .insert(mesh.into(), skin.palette.into());
     }
+    for (skin, transform) in &palette_meshes {
+        let Some(info) = skin_uniforms
+            .palette_info
+            .get_mut(&MainEntity::from(skin.palette))
+        else {
+            continue;
+        };
+        let world_from_local = transform.to_matrix();
+        if info.world_from_local != world_from_local {
+            info.world_from_local = world_from_local;
+            info.dirty = true;
+        }
+    }
+    let SkinUniforms {
+        palette_info,
+        current_staging_buffer,
+        ..
+    } = skin_uniforms;
+    for info in palette_info.values_mut().filter(|info| info.dirty) {
+        info.dirty = false;
+        let start = info.offset() as usize;
+        if current_staging_buffer.len() < start + info.len {
+            current_staging_buffer.resize(start + info.len, Mat4::IDENTITY);
+        }
+        for (slot, local) in current_staging_buffer[start..start + info.len]
+            .iter_mut()
+            .zip(&info.local)
+        {
+            *slot = info.world_from_local * *local;
+        }
+    }
 }
 
-/// Writes a palette's matrices into the staging buffer, allocating its space the first time.
-fn write_palette(skin_uniforms: &mut SkinUniforms, palette: MainEntity, matrices: &[Mat4]) {
+/// Records a palette's matrices, allocating its space the first time.
+fn set_palette(skin_uniforms: &mut SkinUniforms, palette: MainEntity, matrices: &[Mat4]) {
     if !skin_uniforms.palette_info.contains_key(&palette) {
         let Some(allocation) = skin_uniforms.allocator.allocate(
             matrices
@@ -425,10 +457,16 @@ fn write_palette(skin_uniforms: &mut SkinUniforms, palette: MainEntity, matrices
             PaletteInfo {
                 allocation,
                 len: matrices.len(),
+                local: vec![Mat4::IDENTITY; matrices.len()],
+                world_from_local: Mat4::IDENTITY,
+                dirty: true,
             },
         );
     }
-    let info = &skin_uniforms.palette_info[&palette];
+    let info = skin_uniforms
+        .palette_info
+        .get_mut(&palette)
+        .expect("allocated above");
     if info.len != matrices.len() {
         error!(
             "Skin palette {:?} changed length from {} to {}; its length is fixed.",
@@ -437,14 +475,9 @@ fn write_palette(skin_uniforms: &mut SkinUniforms, palette: MainEntity, matrices
             matrices.len()
         );
     }
-    let start = info.offset() as usize;
     let len = info.len.min(matrices.len());
-    if skin_uniforms.current_staging_buffer.len() < start + len {
-        skin_uniforms
-            .current_staging_buffer
-            .resize(start + len, Mat4::IDENTITY);
-    }
-    skin_uniforms.current_staging_buffer[start..start + len].copy_from_slice(&matrices[..len]);
+    info.local[..len].copy_from_slice(&matrices[..len]);
+    info.dirty = true;
 }
 
 /// Searches for all skins that have become visible or invisible this frame and

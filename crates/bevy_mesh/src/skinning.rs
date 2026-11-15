@@ -25,10 +25,10 @@ pub struct SkinnedMesh {
 /// this entity in their [`PaletteSkinnedMesh`].
 ///
 /// Each matrix takes a vertex from bind space to the local space of the meshes that use the
-/// palette (a joint's transform in that space times its inverse bindpose), and the mesh's own
-/// `GlobalTransform` then places the result in the world. Meshes sharing one palette must
-/// therefore share one local space, and a palette that only moves with its meshes does not
-/// change. A mesh's joint indices index the palette directly.
+/// palette (a joint's transform in that space times its inverse bindpose). The renderer folds the
+/// meshes' `GlobalTransform` into each matrix when it writes the palette to the GPU, once a
+/// palette rather than once a vertex, so meshes sharing one palette must share one
+/// `GlobalTransform`. A mesh's joint indices index the palette directly.
 ///
 /// The palette's length is fixed once the renderer first sees it.
 #[derive(Component, Debug, Default, Clone, PartialEq)]

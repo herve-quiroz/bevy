@@ -2,7 +2,6 @@
 
 #import bevy_pbr::mesh_types::SkinnedMesh
 #import bevy_pbr::mesh_bindings::mesh
-#import bevy_render::maths::affine3_to_square
 
 #ifdef SKINNED
 
@@ -24,32 +23,23 @@
 @group(2) @binding(6) var<storage> prev_joint_matrices: array<mat4x4<f32>>;
 #endif  // SKINS_USE_UNIFORM_BUFFERS
 
-// The bit of a mesh's skin index that says its joint matrices are in the mesh's local space
-// (a skin palette): the mesh's own transform then places the skinned vertex in the world.
-const LOCAL_SPACE_SKIN_INDEX_BIT: u32 = 1u << 31u;
-
 fn skin_model(
     indexes: vec4<u32>,
     weights: vec4<f32>,
     instance_index: u32,
 ) -> mat4x4<f32> {
-    let raw_skin_index = mesh[instance_index].current_skin_index;
 #ifdef SKINS_USE_UNIFORM_BUFFERS
-    let skinned = weights.x * joint_matrices.data[indexes.x]
+    return weights.x * joint_matrices.data[indexes.x]
         + weights.y * joint_matrices.data[indexes.y]
         + weights.z * joint_matrices.data[indexes.z]
         + weights.w * joint_matrices.data[indexes.w];
 #else   // SKINS_USE_UNIFORM_BUFFERS
-    let skin_index = raw_skin_index & ~LOCAL_SPACE_SKIN_INDEX_BIT;
-    let skinned = weights.x * joint_matrices[skin_index + indexes.x]
+    var skin_index = mesh[instance_index].current_skin_index;
+    return weights.x * joint_matrices[skin_index + indexes.x]
         + weights.y * joint_matrices[skin_index + indexes.y]
         + weights.z * joint_matrices[skin_index + indexes.z]
         + weights.w * joint_matrices[skin_index + indexes.w];
 #endif  // SKINS_USE_UNIFORM_BUFFERS
-    if (raw_skin_index & LOCAL_SPACE_SKIN_INDEX_BIT) != 0u && raw_skin_index != 0xffffffffu {
-        return affine3_to_square(mesh[instance_index].world_from_local) * skinned;
-    }
-    return skinned;
 }
 
 // Returns the skinned position of a vertex with the given weights from the
@@ -61,23 +51,18 @@ fn skin_prev_model(
     weights: vec4<f32>,
     instance_index: u32,
 ) -> mat4x4<f32> {
-    let raw_skin_index = mesh[instance_index].current_skin_index;
 #ifdef SKINS_USE_UNIFORM_BUFFERS
-    let skinned = weights.x * prev_joint_matrices.data[indexes.x]
+    return weights.x * prev_joint_matrices.data[indexes.x]
         + weights.y * prev_joint_matrices.data[indexes.y]
         + weights.z * prev_joint_matrices.data[indexes.z]
         + weights.w * prev_joint_matrices.data[indexes.w];
 #else   // SKINS_USE_UNIFORM_BUFFERS
-    let skin_index = raw_skin_index & ~LOCAL_SPACE_SKIN_INDEX_BIT;
-    let skinned = weights.x * prev_joint_matrices[skin_index + indexes.x]
+    let skin_index = mesh[instance_index].current_skin_index;
+    return weights.x * prev_joint_matrices[skin_index + indexes.x]
         + weights.y * prev_joint_matrices[skin_index + indexes.y]
         + weights.z * prev_joint_matrices[skin_index + indexes.z]
         + weights.w * prev_joint_matrices[skin_index + indexes.w];
 #endif  // SKINS_USE_UNIFORM_BUFFERS
-    if (raw_skin_index & LOCAL_SPACE_SKIN_INDEX_BIT) != 0u && raw_skin_index != 0xffffffffu {
-        return affine3_to_square(mesh[instance_index].previous_world_from_local) * skinned;
-    }
-    return skinned;
 }
 
 fn inverse_transpose_3x3m(in: mat3x3<f32>) -> mat3x3<f32> {

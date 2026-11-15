@@ -1,4 +1,5 @@
 use core::mem::{self, size_of};
+use core::ops::Range;
 
 use bevy_asset::{prelude::AssetChanged, Assets};
 use bevy_camera::visibility::ViewVisibility;
@@ -41,6 +42,10 @@ const MAX_TOTAL_JOINTS: u32 = 1024 * 1024 * 1024;
 /// we need to allocate 4 64-byte matrices at a time to satisfy alignment
 /// requirements.
 const JOINTS_PER_ALLOCATION_UNIT: u32 = (256 / size_of::<Mat4>()) as u32;
+
+/// The largest run of unchanged joints between two changed ranges that is uploaded with them
+/// rather than splitting the upload in two: 4 KiB.
+const UPLOAD_MERGE_GAP_JOINTS: u32 = 64;
 
 /// The location of the first joint matrix in the skin uniform buffer.
 #[derive(Clone, Copy)]
@@ -99,6 +104,11 @@ pub struct SkinUniforms {
     palette_info: MainEntityHashMap<PaletteInfo>,
     /// The palette entity of each mesh skinned by a [`PaletteSkinnedMesh`].
     palette_of: MainEntityHashMap<MainEntity>,
+    /// The ranges of joints in [`Self::current_staging_buffer`] written this frame.
+    changed: Vec<Range<u32>>,
+    /// The ranges written last frame: the buffer from two frames ago that this frame overwrites
+    /// lacks them too.
+    prev_changed: Vec<Range<u32>>,
 }
 
 pub fn skin_uniforms_from_world(device: Res<RenderDevice>, mut commands: Commands) {
@@ -133,6 +143,8 @@ pub fn skin_uniforms_from_world(device: Res<RenderDevice>, mut commands: Command
         total_joints: 0,
         palette_info: MainEntityHashMap::default(),
         palette_of: MainEntityHashMap::default(),
+        changed: Vec::new(),
+        prev_changed: Vec::new(),
     };
 
     commands.insert_resource(res);
@@ -278,18 +290,55 @@ pub fn prepare_skins(
             0,
             bytemuck::must_cast_slice(&uniform.current_staging_buffer[..]),
         );
+        render_queue.write_buffer(
+            &uniform.current_buffer,
+            0,
+            bytemuck::must_cast_slice(&uniform.current_staging_buffer[..]),
+        );
+    } else {
+        // `uniform.current_buffer` holds the joints of two frames ago: write what changed on
+        // the last frame or on this one.
+        for range in upload_ranges(
+            &uniform.prev_changed,
+            &uniform.changed,
+            uniform.current_staging_buffer.len() as u32,
+        ) {
+            render_queue.write_buffer(
+                &uniform.current_buffer,
+                range.start as u64 * size_of::<Mat4>() as u64,
+                bytemuck::must_cast_slice(
+                    &uniform.current_staging_buffer[range.start as usize..range.end as usize],
+                ),
+            );
+        }
     }
-
-    // Write the data from `uniform.current_staging_buffer` into
-    // `uniform.current_buffer`.
-    render_queue.write_buffer(
-        &uniform.current_buffer,
-        0,
-        bytemuck::must_cast_slice(&uniform.current_staging_buffer[..]),
-    );
+    uniform.prev_changed = mem::take(&mut uniform.changed);
 
     // We don't need to write `uniform.prev_buffer` because we already wrote it
     // last frame, and the data should still be on the GPU.
+}
+
+/// The ranges of joints to upload into the buffer from two frames ago: those changed on the last
+/// frame or on this one, sorted, clipped to `len`, overlapping ones joined and ones closer than
+/// [`UPLOAD_MERGE_GAP_JOINTS`] merged.
+fn upload_ranges(prev_changed: &[Range<u32>], changed: &[Range<u32>], len: u32) -> Vec<Range<u32>> {
+    let mut all: Vec<Range<u32>> = prev_changed
+        .iter()
+        .chain(changed)
+        .map(|r| r.start.min(len)..r.end.min(len))
+        .filter(|r| !r.is_empty())
+        .collect();
+    all.sort_unstable_by_key(|r| r.start);
+    let mut merged: Vec<Range<u32>> = Vec::with_capacity(all.len());
+    for r in all {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end + UPLOAD_MERGE_GAP_JOINTS => {
+                last.end = last.end.max(r.end);
+            }
+            _ => merged.push(r),
+        }
+    }
+    merged
 }
 
 // Notes on implementation:
@@ -419,11 +468,13 @@ pub fn extract_skins(
     let SkinUniforms {
         palette_info,
         current_staging_buffer,
+        changed,
         ..
     } = skin_uniforms;
     for info in palette_info.values_mut().filter(|info| info.dirty) {
         info.dirty = false;
         let start = info.offset() as usize;
+        changed.push(info.offset()..info.offset() + info.len as u32);
         if current_staging_buffer.len() < start + info.len {
             current_staging_buffer.resize(start + info.len, Mat4::IDENTITY);
         }
@@ -554,6 +605,8 @@ fn extract_joints_for_skin(
     };
 
     // Calculate and write in the new joint matrices, if they changed this frame.
+    let offset = skin_uniform_info.offset();
+    let mut written: Option<Range<u32>> = None;
     for (joint_index, (&joint, skinned_mesh_inverse_bindpose)) in skin
         .joints
         .iter()
@@ -566,9 +619,14 @@ fn extract_joints_for_skin(
         };
 
         let joint_matrix = joint_transform.affine() * *skinned_mesh_inverse_bindpose;
-        skin_uniforms.current_staging_buffer[skin_uniform_info.offset() as usize + joint_index] =
-            joint_matrix;
+        skin_uniforms.current_staging_buffer[offset as usize + joint_index] = joint_matrix;
+        let at = offset + joint_index as u32;
+        written = Some(match written {
+            Some(r) => r.start..at + 1,
+            None => at..at + 1,
+        });
     }
+    skin_uniforms.changed.extend(written);
 }
 
 /// Allocates space for a new skin in the buffers, and populates its joints.
@@ -633,6 +691,10 @@ fn add_skin(
 
     // Record the number of joints.
     skin_uniforms.total_joints += skinned_mesh.joints.len();
+    let offset = skin_uniform_info.offset();
+    skin_uniforms
+        .changed
+        .push(offset..offset + skinned_mesh.joints.len() as u32);
 
     skin_uniforms
         .skin_uniform_info
@@ -674,5 +736,35 @@ pub fn no_automatic_skin_batching(
 
     for entity in &query {
         commands.entity(entity).try_insert(NoAutomaticBatching);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_ranges;
+
+    #[test]
+    fn upload_ranges_join_this_frame_and_the_last() {
+        assert_eq!(
+            upload_ranges(&[0..4], &[200..210], 1000),
+            vec![0..4, 200..210]
+        );
+        // Overlapping, touching and nearby ranges join.
+        assert_eq!(
+            upload_ranges(&[10..20], &[15..30, 30..40], 1000),
+            vec![10..40]
+        );
+        assert_eq!(upload_ranges(&[0..4], &[60..64], 1000), vec![0..64]);
+        // Clipped to the staging buffer.
+        assert_eq!(upload_ranges(&[], &[90..120], 100), vec![90..100]);
+        assert!(upload_ranges(&[], &[], 100).is_empty());
+    }
+
+    /// A palette written last frame and unchanged this frame is uploaded again: the buffer this
+    /// frame overwrites is the one from two frames ago, which lacks it, and the other buffer,
+    /// last frame's, is this frame's previous copy, so motion vectors see no movement.
+    #[test]
+    fn a_palette_changed_last_frame_only_is_uploaded_again() {
+        assert_eq!(upload_ranges(&[128..193], &[], 1000), vec![128..193]);
     }
 }

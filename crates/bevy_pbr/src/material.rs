@@ -1462,6 +1462,13 @@ pub fn base_specialize(
     layout: &MeshVertexBufferLayoutRef,
     properties: &Arc<MaterialProperties>,
 ) -> Result<CachedRenderPipelineId, SpecializedMeshPipelineError> {
+    if let Some(pipelines) =
+        world.get_resource::<SpecializedMeshPipelines<MaterialPipelineSpecializer>>()
+        && let Some(id) = pipelines.get_pipeline(&key, layout)
+    {
+        return Ok(id);
+    }
+
     world.resource_scope(
         |world, mut pipelines: Mut<SpecializedMeshPipelines<MaterialPipelineSpecializer>>| {
             let mesh_pipeline = world.resource::<MeshPipeline>().clone();
@@ -1478,10 +1485,17 @@ pub fn base_specialize(
 }
 fn prepass_specialize(
     world: &mut World,
-    key: ErasedMaterialPipelineKey,
+    key: &ErasedMaterialPipelineKey,
     layout: &MeshVertexBufferLayoutRef,
     properties: &Arc<MaterialProperties>,
 ) -> Result<CachedRenderPipelineId, SpecializedMeshPipelineError> {
+    if let Some(pipelines) =
+        world.get_resource::<SpecializedMeshPipelines<PrepassPipelineSpecializer>>()
+        && let Some(id) = pipelines.get_pipeline(key, layout)
+    {
+        return Ok(id);
+    }
+
     world.resource_scope(
         |world, mut pipelines: Mut<SpecializedMeshPipelines<PrepassPipelineSpecializer>>| {
             let prepass_pipeline = world.resource::<PrepassPipeline>().clone();
@@ -1492,7 +1506,7 @@ fn prepass_specialize(
                 properties: properties.clone(),
             };
 
-            pipelines.specialize(pipeline_cache, &specializer, key, layout)
+            pipelines.specialize(pipeline_cache, &specializer, key.clone(), layout)
         },
     )
 }

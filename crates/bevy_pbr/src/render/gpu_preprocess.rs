@@ -51,7 +51,7 @@ use bevy_render::{
     render_resource::{
         binding_types::{storage_buffer, storage_buffer_read_only, texture_2d, uniform_buffer},
         BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-        BindingResource, Buffer, BufferBinding, BufferVec, CachedComputePipelineId,
+        BindingResource, Buffer, BufferBinding, BufferId, BufferVec, CachedComputePipelineId,
         ComputePassDescriptor, ComputePipelineDescriptor, DynamicBindGroupLayoutEntries,
         PartialBufferVec, PipelineCache, RawBufferVec, ShaderStages, ShaderType,
         SparseBufferUpdateBindGroups, SparseBufferUpdateJobs, SparseBufferUpdatePipelines,
@@ -357,12 +357,50 @@ pub struct BinUnpackingBindGroups(
 
 /// The bind groups for the `unpack_bins` shader for a single (view, phase)
 /// combination.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ViewPhaseBinUnpackingBindGroups {
     /// The bind group for the indexed meshes.
     indexed: Vec<ViewPhaseBinUnpackingBindGroup>,
     /// The bind group for the non-indexed meshes.
     non_indexed: Vec<ViewPhaseBinUnpackingBindGroup>,
+    /// The bind groups of the indexed meshes, kept across frames.
+    indexed_cache: BinUnpackingBindGroupCache,
+    /// The bind groups of the non-indexed meshes, kept across frames.
+    non_indexed_cache: BinUnpackingBindGroupCache,
+}
+
+/// The bin unpacking bind groups of one (view, phase, mesh indexed-ness)
+/// combination, kept across frames and keyed by every buffer they bind.
+///
+/// The metadata offset is a dynamic offset, so it is not part of the key: a
+/// batch set's offset can change without any buffer being reallocated.
+#[derive(Clone, Default)]
+struct BinUnpackingBindGroupCache {
+    entries: HashMap<[BufferId; 4], (BindGroup, u8)>,
+}
+
+impl BinUnpackingBindGroupCache {
+    fn begin_frame(&mut self) {
+        for (_, age) in self.entries.values_mut() {
+            *age = age.saturating_add(1);
+        }
+    }
+
+    fn get_or_create(
+        &mut self,
+        buffers: [BufferId; 4],
+        create: impl FnOnce() -> BindGroup,
+    ) -> BindGroup {
+        let (bind_group, age) = self.entries.entry(buffers).or_insert_with(|| (create(), 0));
+        *age = 0;
+        bind_group.clone()
+    }
+
+    fn finish_frame(&mut self) {
+        // Keep a bind group unused for one frame, for buffers that alternate
+        // between two allocations.
+        self.entries.retain(|_, (_, age)| *age < 2);
+    }
 }
 
 /// The bind group for the `unpack_bins` shader for a single combination of
@@ -585,7 +623,11 @@ pub fn unpack_bins(
                     .iter()
                     .chain(phase_bin_unpacking_bind_groups.non_indexed.iter())
                 {
-                    compute_pass.set_bind_group(0, &bin_unpacking_bind_group.bind_group, &[]);
+                    compute_pass.set_bind_group(
+                        0,
+                        &bin_unpacking_bind_group.bind_group,
+                        &[bin_unpacking_bind_group.metadata_index.uniform_offset()],
+                    );
                     let workgroup_count = (bin_unpacking_bind_group.mesh_instance_count as usize)
                         .div_ceil(WORKGROUP_SIZE);
                     if workgroup_count > 0 {
@@ -1499,7 +1541,7 @@ fn bin_unpacking_bind_group_layout_entries() -> BindGroupLayoutEntries<4> {
         (
             // @group(0) @binding(0) var<uniform> bin_unpacking_metadata:
             // BinUnpackingMetadata;
-            uniform_buffer::<GpuBinUnpackingMetadata>(false),
+            uniform_buffer::<GpuBinUnpackingMetadata>(true),
             // @group(0) @binding(1) var<storage> binned_mesh_instances:
             // array<BinnedMeshInstance>;
             storage_buffer_read_only::<GpuRenderBinnedMeshInstance>(false),
@@ -1811,6 +1853,13 @@ pub fn prepare_preprocess_bind_groups(
     pipelines: Res<PreprocessPipelines>,
     mut bin_unpacking_bind_groups: ResMut<BinUnpackingBindGroups>,
 ) {
+    for groups in bin_unpacking_bind_groups.values_mut() {
+        groups.indexed.clear();
+        groups.non_indexed.clear();
+        groups.indexed_cache.begin_frame();
+        groups.non_indexed_cache.begin_frame();
+    }
+
     // Grab the `BatchedInstanceBuffers`.
     let BatchedInstanceBuffers {
         current_input_buffer: current_input_buffer_vec,
@@ -1822,6 +1871,7 @@ pub fn prepare_preprocess_bind_groups(
         current_input_buffer_vec.buffer().buffer(),
         previous_input_buffer_vec.buffer(),
     ) else {
+        bin_unpacking_bind_groups.clear();
         return;
     };
 
@@ -1953,6 +2003,13 @@ pub fn prepare_preprocess_bind_groups(
             &view.retained_view_entity,
         );
     }
+
+    // Drop the (view, phase) combinations that had no jobs this frame.
+    bin_unpacking_bind_groups.retain(|_, groups| {
+        groups.indexed_cache.finish_frame();
+        groups.non_indexed_cache.finish_frame();
+        !groups.indexed.is_empty() || !groups.non_indexed.is_empty()
+    });
 }
 
 /// A temporary structure that stores all the information needed to construct
@@ -2850,48 +2907,41 @@ fn create_bin_unpacking_bind_groups(
             } => non_indexed.buffer(),
         };
 
-        // Create the actual bind groups.
-        bin_unpacking_bind_groups.insert(
-            bin_unpacking_buffers_key,
-            ViewPhaseBinUnpackingBindGroups {
-                indexed: match maybe_indexed_work_item_buffer {
-                    Some(indexed_work_item_buffer) => view_phase_bin_unpacking_buffers
-                        .indexed_unpacking_jobs
-                        .iter()
-                        .map(|job| {
-                            create_bin_unpacking_bind_group(
-                                render_device,
-                                preprocess_pipelines,
-                                pipeline_cache,
-                                job,
-                                bin_unpacking_metadata_buffer,
-                                indexed_work_item_buffer,
-                                true,
-                            )
-                        })
-                        .collect(),
-                    None => vec![],
-                },
-                non_indexed: match maybe_non_indexed_work_item_buffer {
-                    Some(non_indexed_work_item_buffer) => view_phase_bin_unpacking_buffers
-                        .non_indexed_unpacking_jobs
-                        .iter()
-                        .map(|job| {
-                            create_bin_unpacking_bind_group(
-                                render_device,
-                                preprocess_pipelines,
-                                pipeline_cache,
-                                job,
-                                bin_unpacking_metadata_buffer,
-                                non_indexed_work_item_buffer,
-                                false,
-                            )
-                        })
-                        .collect(),
-                    None => vec![],
-                },
-            },
-        );
+        // Create the bind groups, or take them from the last frames'.
+        let groups = bin_unpacking_bind_groups
+            .entry(bin_unpacking_buffers_key)
+            .or_default();
+        for (work_items, jobs, output, cache, indexed) in [
+            (
+                maybe_indexed_work_item_buffer,
+                &view_phase_bin_unpacking_buffers.indexed_unpacking_jobs,
+                &mut groups.indexed,
+                &mut groups.indexed_cache,
+                true,
+            ),
+            (
+                maybe_non_indexed_work_item_buffer,
+                &view_phase_bin_unpacking_buffers.non_indexed_unpacking_jobs,
+                &mut groups.non_indexed,
+                &mut groups.non_indexed_cache,
+                false,
+            ),
+        ] {
+            if let Some(work_items) = work_items {
+                output.extend(jobs.iter().map(|job| {
+                    create_bin_unpacking_bind_group(
+                        render_device,
+                        preprocess_pipelines,
+                        pipeline_cache,
+                        job,
+                        bin_unpacking_metadata_buffer,
+                        work_items,
+                        indexed,
+                        cache,
+                    )
+                }));
+            }
+        }
     }
 }
 
@@ -2905,39 +2955,48 @@ fn create_bin_unpacking_bind_group(
     bin_unpacking_metadata_buffer: &Buffer,
     work_item_buffer: &Buffer,
     indexed: bool,
+    cache: &mut BinUnpackingBindGroupCache,
 ) -> ViewPhaseBinUnpackingBindGroup {
-    let bind_group = render_device.create_bind_group(
-        if indexed {
-            "bin unpacking indexed bind group"
-        } else {
-            "bin unpacking non-indexed bind group"
-        },
-        &pipeline_cache
-            .get_bind_group_layout(&preprocess_pipelines.bin_unpacking.bind_group_layout),
-        &BindGroupEntries::sequential((
-            // @group(0) @binding(0) var<uniform>
-            // bin_unpacking_metadata:
-            // BinUnpackingMetadata;
-            BindingResource::Buffer(BufferBinding {
-                buffer: bin_unpacking_metadata_buffer,
-                offset: job.bin_unpacking_metadata_index.uniform_offset() as u64,
-                size: NonZeroU64::new(size_of::<GpuBinUnpackingMetadata>() as u64),
-            }),
-            // @group(0) @binding(1) var<storage>
-            // binned_mesh_instances:
-            // array<BinnedMeshInstance>;
-            job.render_binned_mesh_instance_buffer.as_entire_binding(),
-            // @group(0) @binding(2) var<storage,
-            // read_write> preprocess_work_items:
-            // array<PreprocessWorkItem>;
-            work_item_buffer.as_entire_binding(),
-            // @group(0) @binding(3) var<storage>
-            // bin_index_to_indirect_parameters_offset:
-            // array<u32>;
-            job.bin_index_to_indirect_parameters_offset_buffer
-                .as_entire_binding(),
-        )),
-    );
+    let buffers = [
+        bin_unpacking_metadata_buffer.id(),
+        job.render_binned_mesh_instance_buffer.id(),
+        work_item_buffer.id(),
+        job.bin_index_to_indirect_parameters_offset_buffer.id(),
+    ];
+    let bind_group = cache.get_or_create(buffers, || {
+        render_device.create_bind_group(
+            if indexed {
+                "bin unpacking indexed bind group"
+            } else {
+                "bin unpacking non-indexed bind group"
+            },
+            &pipeline_cache
+                .get_bind_group_layout(&preprocess_pipelines.bin_unpacking.bind_group_layout),
+            &BindGroupEntries::sequential((
+                // @group(0) @binding(0) var<uniform>
+                // bin_unpacking_metadata:
+                // BinUnpackingMetadata;
+                BindingResource::Buffer(BufferBinding {
+                    buffer: bin_unpacking_metadata_buffer,
+                    offset: 0,
+                    size: NonZeroU64::new(size_of::<GpuBinUnpackingMetadata>() as u64),
+                }),
+                // @group(0) @binding(1) var<storage>
+                // binned_mesh_instances:
+                // array<BinnedMeshInstance>;
+                job.render_binned_mesh_instance_buffer.as_entire_binding(),
+                // @group(0) @binding(2) var<storage,
+                // read_write> preprocess_work_items:
+                // array<PreprocessWorkItem>;
+                work_item_buffer.as_entire_binding(),
+                // @group(0) @binding(3) var<storage>
+                // bin_index_to_indirect_parameters_offset:
+                // array<u32>;
+                job.bin_index_to_indirect_parameters_offset_buffer
+                    .as_entire_binding(),
+            )),
+        )
+    });
     ViewPhaseBinUnpackingBindGroup {
         metadata_index: job.bin_unpacking_metadata_index,
         bind_group,
